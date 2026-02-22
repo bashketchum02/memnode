@@ -16,8 +16,8 @@ memnode is an opinionated knowledge management system where you tag entities inl
 │                                                                    │
 │    person:sarah ──────┐                                            │
 │           │           │                                            │
-│           ▼          ▼                                           │
-│    topic:kubernetes  project:memnode ◄─── team:platform           │
+│           ▼           ▼                                            │
+│    topic:kubernetes  project:memnode ◄─── team:platform            │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
 ```
