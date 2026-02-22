@@ -307,7 +307,16 @@ class SmartIndexer:
         if inferred_refs:
             logger.info(f"Found {len(inferred_refs)} inferred references in {entity_id}")
         
-        # 3. Compute co-occurrence relationships
+        # 3. Compute relationships from explicit references
+        logger.debug(f"Computing reference relationships for {entity_id}")
+        ref_rels = self.relationship_inferrer.compute_reference_relationships(entity_id)
+        for rel in ref_rels:
+            self.relationship_inferrer.save_inferred_relationship(rel)
+        
+        if ref_rels:
+            logger.info(f"Found {len(ref_rels)} reference relationships for {entity_id}")
+        
+        # 4. Compute co-occurrence relationships
         logger.debug(f"Computing co-occurrence for {entity_id}")
         cooccur_rels = self.relationship_inferrer.compute_cooccurrence(entity_id)
         for rel in cooccur_rels:

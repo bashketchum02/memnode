@@ -667,6 +667,7 @@ def show(
         memnode show project:memnode
     """
     entity_type, slug = parse_entity(entity)
+    entity_id = f"{entity_type}:{slug}"
     path = get_entity_path(entity_type, slug)
     
     if not path.exists():
@@ -693,20 +694,39 @@ def show(
         if key not in ["type", "name"] and value:
             rprint(f"[dim]{key}:[/dim] {value}")
     
-    # Show relationships
+    # Show explicit relationships
     relationships = load_relationships()
     outgoing = [r for r in relationships if r["source"] == slug and r["source_type"] == entity_type]
     incoming = [r for r in relationships if r["target"] == slug and r["target_type"] == entity_type]
     
-    if outgoing:
-        rprint("\n[bold]Outgoing relationships:[/bold]")
+    if outgoing or incoming:
+        rprint("\n[bold]Relationships:[/bold]")
         for r in outgoing:
             rprint(f"  --\\[{r['relation']}]--> {r['target_type']}:{r['target']}")
-    
-    if incoming:
-        rprint("\n[bold]Incoming relationships:[/bold]")
         for r in incoming:
             rprint(f"  <--\\[{r['relation']}]-- {r['source_type']}:{r['source']}")
+    
+    # Show inferred relationships
+    try:
+        from .nlp import RelationshipInferrer
+        notes_dir = get_notes_dir()
+        db_path = notes_dir / ".memnode.db"
+        
+        if db_path.exists():
+            inferrer = RelationshipInferrer(db_path)
+            inferred = inferrer.get_inferred_relationships(entity_id, min_confidence=0.5)
+            
+            if inferred:
+                rprint("\n[bold]Inferred relationships:[/bold] [dim](from mentions & co-occurrence)[/dim]")
+                for r in inferred[:10]:  # Limit to top 10
+                    if r["source_id"] == entity_id:
+                        rprint(f"  [dim]--\\[{r['relation']}]-->[/dim] {r['target_id']} [dim]({r['confidence']:.0%})[/dim]")
+                    else:
+                        rprint(f"  [dim]<--\\[{r['relation']}]--[/dim] {r['source_id']} [dim]({r['confidence']:.0%})[/dim]")
+                if len(inferred) > 10:
+                    rprint(f"  [dim]... and {len(inferred) - 10} more[/dim]")
+    except Exception:
+        pass  # Silently skip if NLP components not available
     
     rprint(f"\n[dim]File: {path}[/dim]")
 

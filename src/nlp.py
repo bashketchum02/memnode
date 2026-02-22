@@ -4,12 +4,13 @@ NLP utilities for intelligent entity extraction and relationship inference.
 Key features:
 - Alias management (explicit aliases + auto-generated from names)
 - Fuzzy entity matching using rapidfuzz
-- Named Entity Recognition using spaCy
+- Named Entity Recognition (regex-based, with optional spaCy enhancement)
 - TF-IDF vectorization for content similarity
 - Co-occurrence analysis for relationship inference
 """
 
 import json
+import logging
 import re
 import sqlite3
 from collections import defaultdict
@@ -19,27 +20,167 @@ from typing import Optional
 
 from rapidfuzz import fuzz, process
 
+logger = logging.getLogger(__name__)
+
 # Lazy imports for optional heavy dependencies
 _spacy_nlp = None
-_tfidf_vectorizer = None
+_spacy_available = None  # None = not checked, True/False = checked
 
 
 def get_spacy_nlp():
-    """Lazy load spaCy model."""
-    global _spacy_nlp
+    """Lazy load spaCy model. Returns None if spaCy is unavailable."""
+    global _spacy_nlp, _spacy_available
+    
+    # If we already know spaCy isn't available, don't retry
+    if _spacy_available is False:
+        return None
+    
     if _spacy_nlp is None:
         try:
             import spacy
-            try:
-                _spacy_nlp = spacy.load("en_core_web_sm")
-            except OSError:
-                # Model not installed, download it
-                import subprocess
-                subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], check=True)
-                _spacy_nlp = spacy.load("en_core_web_sm")
-        except ImportError:
+            _spacy_nlp = spacy.load("en_core_web_sm")
+            _spacy_available = True
+        except Exception as e:
+            # spaCy not available (not installed, model missing, or Python version incompatible)
+            logger.debug(f"spaCy not available: {e}")
+            _spacy_available = False
             return None
+    
     return _spacy_nlp
+
+
+# =============================================================================
+# Regex-based NER (lightweight alternative to spaCy)
+# =============================================================================
+
+# Pattern for potential person names: "FirstName LastName" or "FirstName MiddleName LastName"
+# Matches: "John Smith", "Sarah Chen", "Mary Jane Watson"
+# Requires: First word capitalized + lowercase, second word same pattern
+PERSON_NAME_PATTERN = re.compile(
+    r'\b([A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b'
+)
+
+# Pattern for potential organization/company names
+# Matches: "Acme Corp", "Acme Inc", "Acme LLC", "Acme Corporation"
+ORG_SUFFIX_PATTERN = re.compile(
+    r'\b([A-Z][a-zA-Z]+\s+(?:Corp|Inc|LLC|Ltd|Company|Corporation|Group|Foundation|Institute|University|Labs?))\b',
+    re.IGNORECASE
+)
+
+# Pattern for project/product names: Capitalized words with version numbers or technical terms
+# Matches: "Platform V2", "API Gateway", "Project Alpha", "Auth Service"
+PROJECT_PATTERN = re.compile(
+    r'\b([A-Z][a-zA-Z]*(?:\s+(?:V\d+|[A-Z][a-zA-Z]*)){1,3})\b'
+)
+
+# Pattern for acronyms (2+ capital letters)
+# Matches: "API", "AWS", "GCP", "OAuth"
+ACRONYM_PATTERN = re.compile(
+    r'\b([A-Z]{2,}(?:\d+)?)\b'
+)
+
+
+@dataclass
+class RegexEntity:
+    """An entity found via regex pattern matching."""
+    text: str
+    start: int
+    end: int
+    entity_type: str  # 'PERSON', 'ORG', 'PROJECT', 'ACRONYM'
+
+
+# Common false positives to exclude
+EXCLUDED_PHRASES = {
+    # Common headers/sections
+    'action items', 'action item', 'meeting notes', 'key decisions',
+    'next steps', 'follow up', 'follow ups', 'open questions',
+    'morning', 'afternoon', 'evening', 'reflections',
+    # Common verbs/phrases that get capitalized
+    'connect', 'schedule', 'review', 'discuss', 'draft', 'update',
+    'todo', 'todos', 'done', 'in progress', 'blocked',
+}
+
+
+def extract_entities_regex(text: str) -> list[RegexEntity]:
+    """
+    Extract potential entities using regex patterns.
+    
+    This is a lightweight alternative to spaCy NER that works on any Python version.
+    It's less accurate but catches most common patterns.
+    """
+    entities = []
+    seen_spans = set()  # Avoid duplicates and overlaps
+    
+    def add_if_new(entity: RegexEntity) -> bool:
+        """Add entity if its span doesn't overlap with existing ones."""
+        for start, end in seen_spans:
+            # Check for overlap
+            if not (entity.end <= start or entity.start >= end):
+                return False
+        seen_spans.add((entity.start, entity.end))
+        entities.append(entity)
+        return True
+    
+    def is_excluded(text: str) -> bool:
+        """Check if text is a common false positive."""
+        return text.lower() in EXCLUDED_PHRASES or text.split()[0].lower() in {'connect', 'schedule', 'review', 'discuss', 'draft', 'update'}
+    
+    # 1. Find organizations (most specific, check first)
+    for match in ORG_SUFFIX_PATTERN.finditer(text):
+        add_if_new(RegexEntity(
+            text=match.group(1),
+            start=match.start(),
+            end=match.end(),
+            entity_type='ORG'
+        ))
+    
+    # 2. Find person names (two or three capitalized words)
+    for match in PERSON_NAME_PATTERN.finditer(text):
+        name = match.group(1)
+        # Skip if it ends with org suffixes or is excluded
+        if re.search(r'\b(Corp|Inc|LLC|Ltd|Company|Team|Project|Service|Gateway|Platform)\b', name, re.IGNORECASE):
+            continue
+        if is_excluded(name):
+            continue
+        add_if_new(RegexEntity(
+            text=name,
+            start=match.start(),
+            end=match.end(),
+            entity_type='PERSON'
+        ))
+    
+    # 3. Find project/product names
+    for match in PROJECT_PATTERN.finditer(text):
+        name = match.group(1)
+        # Skip single words (likely caught elsewhere) and person-like names
+        if ' ' not in name:
+            continue
+        # Skip if looks like a person name (two words, both title case)
+        words = name.split()
+        if len(words) == 2 and all(w[0].isupper() and w[1:].islower() for w in words if len(w) > 1):
+            continue
+        if is_excluded(name):
+            continue
+        add_if_new(RegexEntity(
+            text=name,
+            start=match.start(),
+            end=match.end(),
+            entity_type='PROJECT'
+        ))
+    
+    # 4. Find acronyms (but not common words)
+    common_words = {'I', 'A', 'AN', 'THE', 'AND', 'OR', 'BUT', 'IN', 'ON', 'AT', 'TO', 'FOR'}
+    for match in ACRONYM_PATTERN.finditer(text):
+        acronym = match.group(1)
+        if acronym not in common_words and len(acronym) >= 2:
+            add_if_new(RegexEntity(
+                text=acronym,
+                start=match.start(),
+                end=match.end(),
+                entity_type='ACRONYM'
+            ))
+    
+    return entities
 
 
 @dataclass
@@ -81,23 +222,6 @@ class AliasManager:
         self.db_path = db_path
         self.aliases: dict[str, EntityAlias] = {}  # alias_lower -> EntityAlias
         self.entity_aliases: dict[str, list[str]] = defaultdict(list)  # entity_id -> [aliases]
-        self._init_db()
-    
-    def _init_db(self):
-        """Ensure aliases table exists."""
-        conn = sqlite3.connect(self.db_path)
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS aliases (
-                alias TEXT PRIMARY KEY,
-                entity_id TEXT NOT NULL,
-                alias_type TEXT NOT NULL,  -- 'explicit' or 'auto'
-                confidence REAL DEFAULT 1.0,
-                FOREIGN KEY (entity_id) REFERENCES entities(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_aliases_entity ON aliases(entity_id);
-        """)
-        conn.commit()
-        conn.close()
         self._load_aliases()
     
     def _load_aliases(self):
@@ -281,9 +405,9 @@ class EntityMatcher:
         Find all entity mentions in text using NLP.
         
         Uses:
-        1. spaCy NER for PERSON, ORG, PRODUCT entities
-        2. Pattern matching for potential entity mentions
-        3. Fuzzy matching against known entities
+        1. Direct scan for known aliases (case-insensitive)
+        2. spaCy NER (if available) or regex-based NER as fallback
+        3. Fuzzy matching against known entities/aliases
         """
         found_entities = []
         
@@ -297,64 +421,97 @@ class EntityMatcher:
                     return True
             return False
         
-        # 1. Use spaCy NER
+        # Track found spans to avoid duplicates
+        found_spans: set[tuple[int, int]] = set()
+        
+        # 1. DIRECT ALIAS SCAN - Find known aliases in text (case-insensitive)
+        # This catches lowercase mentions like "ingestion platform" that NER misses
+        content_lower = content.lower()
+        for alias_lower, alias_obj in self.alias_manager.aliases.items():
+            if len(alias_lower) < 3:  # Skip very short aliases (e.g., "SC")
+                continue
+            
+            # Find all occurrences of this alias
+            start = 0
+            while True:
+                pos = content_lower.find(alias_lower, start)
+                if pos == -1:
+                    break
+                
+                end = pos + len(alias_lower)
+                
+                # Check word boundaries
+                before_ok = pos == 0 or not content_lower[pos-1].isalnum()
+                after_ok = end == len(content_lower) or not content_lower[end].isalnum()
+                
+                if before_ok and after_ok and not is_in_explicit_span(pos, end):
+                    span = (pos, end)
+                    if span not in found_spans:
+                        found_spans.add(span)
+                        matched_text = content[pos:end]  # Original case
+                        ctx_start = max(0, pos - 50)
+                        ctx_end = min(len(content), end + 50)
+                        context = content[ctx_start:ctx_end].strip()
+                        
+                        found_entities.append(InferredEntity(
+                            text=matched_text,
+                            entity_id=alias_obj.entity_id,
+                            confidence=alias_obj.confidence,
+                            start_pos=pos,
+                            end_pos=end,
+                            context=context,
+                            match_type="direct_alias"
+                        ))
+                
+                start = end
+        
+        # Collect candidate entities from NER
+        candidates: list[tuple[str, int, int, str]] = []  # (text, start, end, source)
+        
+        # 2. Try spaCy NER first (more accurate)
         nlp = get_spacy_nlp()
         if nlp:
             doc = nlp(content)
             for ent in doc.ents:
                 if ent.label_ in ("PERSON", "ORG", "PRODUCT", "GPE", "WORK_OF_ART"):
-                    if is_in_explicit_span(ent.start_char, ent.end_char):
-                        continue
-                    
-                    match = self.match_text(ent.text, min_confidence)
-                    if match:
-                        entity_id, confidence, match_type = match
-                        # Get surrounding context
-                        ctx_start = max(0, ent.start_char - 50)
-                        ctx_end = min(len(content), ent.end_char + 50)
-                        context = content[ctx_start:ctx_end].strip()
-                        
-                        found_entities.append(InferredEntity(
-                            text=ent.text,
-                            entity_id=entity_id,
-                            confidence=confidence,
-                            start_pos=ent.start_char,
-                            end_pos=ent.end_char,
-                            context=context,
-                            match_type=f"ner_{match_type}"
-                        ))
+                    if not is_in_explicit_span(ent.start_char, ent.end_char):
+                        candidates.append((ent.text, ent.start_char, ent.end_char, "spacy"))
+        else:
+            # 3. Fallback to regex-based NER
+            for ent in extract_entities_regex(content):
+                if not is_in_explicit_span(ent.start, ent.end):
+                    candidates.append((ent.text, ent.start, ent.end, "regex"))
         
-        # 2. Scan for capitalized phrases (potential names/projects)
-        # Pattern: 2-4 capitalized words together
+        # 4. Also scan for capitalized phrases not caught by NER
         cap_pattern = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b')
+        
         for match in cap_pattern.finditer(content):
-            if is_in_explicit_span(match.start(), match.end()):
+            span = (match.start(), match.end())
+            if span not in found_spans and not is_in_explicit_span(*span):
+                candidates.append((match.group(1), match.start(), match.end(), "pattern"))
+        
+        # 5. Match all candidates against known entities
+        for text, start, end, source in candidates:
+            span = (start, end)
+            if span in found_spans:  # Skip if already found by direct alias scan
                 continue
-            
-            # Skip if already found by NER
-            already_found = any(
-                e.start_pos == match.start() and e.end_pos == match.end()
-                for e in found_entities
-            )
-            if already_found:
-                continue
-            
-            text = match.group(1)
+                
             entity_match = self.match_text(text, min_confidence)
             if entity_match:
                 entity_id, confidence, match_type = entity_match
-                ctx_start = max(0, match.start() - 50)
-                ctx_end = min(len(content), match.end() + 50)
+                found_spans.add(span)
+                ctx_start = max(0, start - 50)
+                ctx_end = min(len(content), end + 50)
                 context = content[ctx_start:ctx_end].strip()
                 
                 found_entities.append(InferredEntity(
                     text=text,
                     entity_id=entity_id,
                     confidence=confidence,
-                    start_pos=match.start(),
-                    end_pos=match.end(),
+                    start_pos=start,
+                    end_pos=end,
                     context=context,
-                    match_type=f"pattern_{match_type}"
+                    match_type=f"{source}_{match_type}"
                 ))
         
         return found_entities
@@ -365,36 +522,190 @@ class RelationshipInferrer:
     
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self._init_db()
+        # Tables are created by MemnodeIndex._init_db()
     
-    def _init_db(self):
-        """Ensure inferred_relationships table exists."""
+    def compute_reference_relationships(self, entity_id: str) -> list[InferredRelationship]:
+        """
+        Compute relationships from explicit references.
+        
+        When entity A (e.g., project:polaroid) explicitly mentions entity B 
+        (e.g., person:wee-sam-wong) via type:slug syntax, create a relationship.
+        
+        This creates:
+        - For persons mentioned in projects: "contributes_to" relationship
+        - For projects mentioned in persons: "works_on" relationship
+        - Generic: "referenced_in" relationship
+        """
         conn = sqlite3.connect(self.db_path)
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS inferred_relationships (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                relation TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                evidence TEXT,              -- JSON array of context snippets
-                inference_type TEXT,        -- 'co_occurrence', 'semantic', 'ner'
-                last_updated TEXT,
-                UNIQUE(source_id, target_id, relation)
-            );
-            CREATE INDEX IF NOT EXISTS idx_inferred_source ON inferred_relationships(source_id);
-            CREATE INDEX IF NOT EXISTS idx_inferred_target ON inferred_relationships(target_id);
-            CREATE INDEX IF NOT EXISTS idx_inferred_confidence ON inferred_relationships(confidence);
+        conn.row_factory = sqlite3.Row
+        
+        relationships = []
+        entity_type = entity_id.split(":")[0] if ":" in entity_id else None
+        
+        # Get entities that reference this entity (inbound)
+        cursor = conn.execute("""
+            SELECT r.source_id, r.context, e.entity_type as source_type
+            FROM refs r
+            JOIN entities e ON r.source_id = e.id
+            WHERE r.target_id = ?
+        """, (entity_id,))
+        
+        for row in cursor.fetchall():
+            source_id = row["source_id"]
+            source_type = row["source_type"]
+            context = row["context"] or ""
             
-            -- TF-IDF vectors stored as JSON (entity_id -> vector)
-            CREATE TABLE IF NOT EXISTS entity_vectors (
-                entity_id TEXT PRIMARY KEY,
-                tfidf_vector TEXT,          -- JSON sparse vector
-                updated_at TEXT
-            );
-        """)
-        conn.commit()
+            # Determine relationship type based on entity types
+            if entity_type == "person" and source_type == "project":
+                # Person is mentioned in a project -> person contributes_to project
+                relation = "contributes_to"
+                relationships.append(InferredRelationship(
+                    source_id=entity_id,  # person
+                    target_id=source_id,  # project
+                    relation=relation,
+                    confidence=0.9,  # High confidence for explicit references
+                    evidence=[context[:100]] if context else [],
+                    inference_type="explicit_reference"
+                ))
+            elif entity_type == "project" and source_type == "person":
+                # Project is mentioned in a person's file -> person works_on project
+                relation = "works_on"
+                relationships.append(InferredRelationship(
+                    source_id=source_id,  # person
+                    target_id=entity_id,  # project
+                    relation=relation,
+                    confidence=0.9,
+                    evidence=[context[:100]] if context else [],
+                    inference_type="explicit_reference"
+                ))
+            elif entity_type == "person" and source_type == "person":
+                # Person mentioned in another person's file
+                relation = "connected_to"
+                relationships.append(InferredRelationship(
+                    source_id=source_id,
+                    target_id=entity_id,
+                    relation=relation,
+                    confidence=0.85,
+                    evidence=[context[:100]] if context else [],
+                    inference_type="explicit_reference"
+                ))
+            else:
+                # Generic reference
+                relation = "references"
+                relationships.append(InferredRelationship(
+                    source_id=source_id,
+                    target_id=entity_id,
+                    relation=relation,
+                    confidence=0.8,
+                    evidence=[context[:100]] if context else [],
+                    inference_type="explicit_reference"
+                ))
+        
+        # Get entities that this entity references (outbound)
+        cursor = conn.execute("""
+            SELECT r.target_id, r.context, e.entity_type as target_type
+            FROM refs r
+            LEFT JOIN entities e ON r.target_id = e.id
+            WHERE r.source_id = ?
+        """, (entity_id,))
+        
+        for row in cursor.fetchall():
+            target_id = row["target_id"]
+            target_type = row["target_type"]
+            context = row["context"] or ""
+            
+            # Skip if we already handled this relationship in the inbound pass
+            # (to avoid duplicates)
+            existing = any(
+                r.source_id == entity_id and r.target_id == target_id
+                for r in relationships
+            )
+            if existing:
+                continue
+            
+            # Determine relationship type
+            if entity_type == "project" and target_type == "person":
+                # Project mentions a person -> person contributes_to project
+                relation = "contributes_to"
+                relationships.append(InferredRelationship(
+                    source_id=target_id,  # person
+                    target_id=entity_id,  # project
+                    relation=relation,
+                    confidence=0.9,
+                    evidence=[context[:100]] if context else [],
+                    inference_type="explicit_reference"
+                ))
+            elif entity_type == "person" and target_type == "project":
+                # Person mentions a project -> person works_on project
+                relation = "works_on"
+                relationships.append(InferredRelationship(
+                    source_id=entity_id,  # person
+                    target_id=target_id,  # project
+                    relation=relation,
+                    confidence=0.9,
+                    evidence=[context[:100]] if context else [],
+                    inference_type="explicit_reference"
+                ))
+        
+        # Also check inferred_refs for NLP-detected mentions
+        # This catches cases like "ingestion platform" (lowercase) -> project:ingestion-platform
+        cursor = conn.execute("""
+            SELECT ir.target_id, ir.context, ir.confidence, e.entity_type as target_type
+            FROM inferred_refs ir
+            LEFT JOIN entities e ON ir.target_id = e.id
+            WHERE ir.source_id = ?
+            AND ir.target_id != ?
+        """, (entity_id, entity_id))
+        
+        for row in cursor.fetchall():
+            target_id = row["target_id"]
+            target_type = row["target_type"]
+            context = row["context"] or ""
+            ref_confidence = row["confidence"]
+            
+            # Skip if we already have this relationship
+            existing = any(
+                (r.source_id == entity_id and r.target_id == target_id) or
+                (r.target_id == entity_id and r.source_id == target_id)
+                for r in relationships
+            )
+            if existing:
+                continue
+            
+            # Determine relationship type based on entity types
+            if entity_type == "person" and target_type == "project":
+                relation = "works_on"
+                relationships.append(InferredRelationship(
+                    source_id=entity_id,  # person
+                    target_id=target_id,  # project
+                    relation=relation,
+                    confidence=ref_confidence * 0.95,  # Slightly lower than explicit refs
+                    evidence=[context[:100]] if context else [],
+                    inference_type="inferred_reference"
+                ))
+            elif entity_type == "project" and target_type == "person":
+                relation = "contributes_to"
+                relationships.append(InferredRelationship(
+                    source_id=target_id,  # person
+                    target_id=entity_id,  # project
+                    relation=relation,
+                    confidence=ref_confidence * 0.95,
+                    evidence=[context[:100]] if context else [],
+                    inference_type="inferred_reference"
+                ))
+            elif target_type == "topic":
+                relation = "related_to"
+                relationships.append(InferredRelationship(
+                    source_id=entity_id,
+                    target_id=target_id,
+                    relation=relation,
+                    confidence=ref_confidence * 0.9,
+                    evidence=[context[:100]] if context else [],
+                    inference_type="inferred_reference"
+                ))
+        
         conn.close()
+        return relationships
     
     def compute_cooccurrence(self, source_id: str, window_size: int = 3) -> list[InferredRelationship]:
         """
@@ -589,29 +900,7 @@ class InferredRefManager:
     
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self._init_db()
-    
-    def _init_db(self):
-        """Ensure inferred_refs table exists."""
-        conn = sqlite3.connect(self.db_path)
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS inferred_refs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                matched_text TEXT,
-                confidence REAL NOT NULL,
-                context TEXT,
-                start_pos INTEGER,
-                end_pos INTEGER,
-                match_type TEXT,
-                FOREIGN KEY (source_id) REFERENCES entities(id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_inferred_refs_source ON inferred_refs(source_id);
-            CREATE INDEX IF NOT EXISTS idx_inferred_refs_target ON inferred_refs(target_id);
-        """)
-        conn.commit()
-        conn.close()
+        # Tables are created by MemnodeIndex._init_db()
     
     def save_inferred_refs(self, source_id: str, refs: list[InferredEntity]):
         """Save inferred references for a source entity."""

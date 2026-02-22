@@ -28,18 +28,25 @@ dependencies = [
     "python-frontmatter>=1.0.0",
     "typer>=0.24.0",
     "rich>=14.3.3",
-    # Smart indexing dependencies
-    "watchdog>=4.0.0",        # File system monitoring
-    "rapidfuzz>=3.0.0",       # Fast fuzzy string matching
-    "scikit-learn>=1.4.0",    # TF-IDF vectorization
-    "spacy>=3.7.0",           # NER and NLP
+    # Smart indexing dependencies (core)
+    "watchdog>=4.0.0", # File system monitoring
+    "rapidfuzz>=3.0.0", # Fast fuzzy string matching
+    "scikit-learn>=1.4.0", # TF-IDF vectorization
+    "spacey>=0.1.1",
 ]
 
 [project.optional-dependencies]
+nlp = [
+    # spaCy for enhanced NER (Python 3.10-3.13 only, 3.14+ not yet supported)
+    "spacy>=3.7.0; python_version < '3.14'",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "ruff>=0.1.0",
+]
+all = [
+    "memnode[nlp]",
 ]
 
 [project.scripts]

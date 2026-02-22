@@ -109,8 +109,58 @@ class MemnodeIndex:
                 content,
                 tokenize='porter'
             );
+            
+            -- =================================================================
+            -- NLP / Smart Indexing Tables
+            -- =================================================================
+            
+            -- Entity aliases for fuzzy matching
+            CREATE TABLE IF NOT EXISTS aliases (
+                alias TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                alias_type TEXT NOT NULL,     -- 'explicit' or 'auto'
+                confidence REAL DEFAULT 1.0,
+                FOREIGN KEY (entity_id) REFERENCES entities(id)
+            );
+            
+            -- NLP-inferred entity references (fuzzy matches in content)
+            CREATE TABLE IF NOT EXISTS inferred_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                matched_text TEXT,            -- The text that was matched
+                confidence REAL NOT NULL,
+                context TEXT,
+                start_pos INTEGER,
+                end_pos INTEGER,
+                match_type TEXT,              -- 'ner_alias', 'fuzzy', etc.
+                FOREIGN KEY (source_id) REFERENCES entities(id)
+            );
+            
+            -- Inferred relationships from co-occurrence and similarity
+            CREATE TABLE IF NOT EXISTS inferred_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation TEXT NOT NULL,       -- 'mentioned_with', 'similar_to'
+                confidence REAL NOT NULL,
+                evidence TEXT,                -- JSON array of context snippets
+                inference_type TEXT,          -- 'co_occurrence', 'tfidf'
+                last_updated TEXT,
+                UNIQUE(source_id, target_id, relation)
+            );
+            
+            -- TF-IDF vectors (optional, for caching)
+            CREATE TABLE IF NOT EXISTS entity_vectors (
+                entity_id TEXT PRIMARY KEY,
+                tfidf_vector TEXT,            -- JSON sparse vector
+                updated_at TEXT
+            );
 
+            -- =================================================================
             -- Indexes
+            -- =================================================================
+            
             CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
             CREATE INDEX IF NOT EXISTS idx_entities_slug ON entities(slug);
             CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_id);
@@ -120,6 +170,14 @@ class MemnodeIndex:
             CREATE INDEX IF NOT EXISTS idx_todos_due ON todos(due_date);
             CREATE INDEX IF NOT EXISTS idx_todos_priority ON todos(priority);
             CREATE INDEX IF NOT EXISTS idx_todos_completed ON todos(completed);
+            
+            -- NLP indexes
+            CREATE INDEX IF NOT EXISTS idx_aliases_entity ON aliases(entity_id);
+            CREATE INDEX IF NOT EXISTS idx_inferred_refs_source ON inferred_refs(source_id);
+            CREATE INDEX IF NOT EXISTS idx_inferred_refs_target ON inferred_refs(target_id);
+            CREATE INDEX IF NOT EXISTS idx_inferred_rels_source ON inferred_relationships(source_id);
+            CREATE INDEX IF NOT EXISTS idx_inferred_rels_target ON inferred_relationships(target_id);
+            CREATE INDEX IF NOT EXISTS idx_inferred_rels_conf ON inferred_relationships(confidence);
         """)
         self.conn.commit()
 

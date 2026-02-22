@@ -64,10 +64,15 @@ git clone https://github.com/bashketchum02/memnode.git
 cd memnode
 uv sync
 uv run python setup.py
+```
 
-# Download the spaCy model for NLP (one-time, ~15MB)
+**Optional: Enhanced NER with spaCy** (Python 3.10-3.13 only):
+```bash
+uv pip install spacy
 uv run python -m spacy download en_core_web_sm
 ```
+
+> Note: spaCy doesn't support Python 3.14+ yet. On 3.14+, memnode uses built-in regex-based NER which works well for most cases.
 
 ## Quick Start
 
@@ -129,12 +134,14 @@ Blockers:
 - "Sarah" → linked to `person:sarah-chen` (fuzzy match)
 - "platform rewrite" → linked to `project:platform-v2` (alias match)
 - "Mike" → linked to `person:mike-johnson`
-- Co-occurrence relationships inferred (Sarah ↔ platform-v2)
+- Explicit `type:slug` references create relationships (e.g., `person:sarah` in a project file → `contributes_to`)
+- Co-occurrence relationships inferred (entities mentioned near each other)
 - Todos extracted with their entity references
 
 **Query later:**
 - "Who is mentioned with platform-v2?" → finds Sarah, Mike
 - "What does Sarah know about?" → kubernetes, auth (from co-occurrence)
+- "Who contributes to platform-v2?" → finds people mentioned in project file
 
 ## CLI Commands
 
@@ -231,115 +238,193 @@ memnode-server
 
 ## Architecture
 
-memnode is built as a **local-first knowledge graph** with three layers:
+memnode is built as a **local-first social graph** with three layers:
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                            USER INTERFACE                               │
-├─────────────────────────────┬───────────────────────────────────────────┤
-│        CLI (typer)          │            MCP Server                     │
-│        src/cli.py           │           src/server.py                   │
-│                             │                                           │
-│  Commands:                  │  Tools (read-only):                       │
-│  - add, edit, rm            │  - search, fuzzy_find                     │
-│  - link, unlink             │  - get_entity, get_references             │
-│  - capture, todo, journal   │  - get_related, who_knows_about           │
-│  - reindex, watch           │  - find_connection, reindex               │
-│                             │                                           │
-│  [Inline NLP indexing       │  [Serves inferred data to                 │
-│   on every operation]       │   Claude, Cursor, etc.]                   │
-├─────────────────────────────┴───────────────────────────────────────────┤
-│                         SMART INDEXER                                   │
-│                    src/watcher.py + src/nlp.py                          │
-│                                                                         │
-│  SmartIndexer:                    NLP Components:                       │
-│  - Inline post-edit hook          - AliasManager (fuzzy matching)       │
-│  - File watcher (optional)        - EntityMatcher (spaCy NER)           │
-│  - Incremental reindexing         - RelationshipInferrer (TF-IDF)       │
-│                                   - InferredRefManager                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                          CORE INDEXER                                   │
-│                         src/indexer.py                                  │
-│                                                                         │
-│  MemnodeIndex:                                                          │
-│  - Entity CRUD                    - Relationship graph traversal        │
-│  - Reference extraction           - Full-text search (FTS5)             │
-│  - Todo parsing                   - SQLite persistence                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                          DATA LAYER                                     │
-├─────────────────────────────┬───────────────────────────────────────────┤
-│     Markdown Files          │         SQLite Database                   │
-│     (your notes)            │        (.memnode.db)                      │
-│                             │                                           │
-│  people/sarah-chen.md       │  Tables:                                  │
-│  projects/platform-v2.md    │  - entities (id, type, content, meta)     │
-│  journal/2025-02-21.md      │  - refs (explicit type:slug references)   │
-│  todos/inbox.md             │  - relationships (explicit links)         │
-│                             │  - aliases (name → entity mapping)        │
-│  .relationships.yaml        │  - inferred_refs (NLP-matched mentions)   │
-│  (explicit relationships)   │  - inferred_relationships (co-occurrence) │
-│                             │  - entities_fts (full-text search)        │
-└─────────────────────────────┴───────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph UI["User Interface"]
+        CLI["CLI (typer)<br/>src/cli.py<br/><br/>add, edit, rm<br/>link, unlink<br/>capture, todo, journal"]
+        MCP["MCP Server<br/>src/server.py<br/><br/>search, fuzzy_find<br/>get_entity, get_related<br/>who_knows_about"]
+    end
+
+    subgraph Smart["Smart Indexer"]
+        Watcher["SmartIndexer<br/>src/watcher.py<br/><br/>Inline post-edit hook<br/>File watcher (optional)<br/>Incremental reindexing"]
+        NLP["NLP Components<br/>src/nlp.py<br/><br/>AliasManager<br/>EntityMatcher (spaCy)<br/>RelationshipInferrer (TF-IDF)"]
+    end
+
+    subgraph Core["Core Indexer"]
+        Indexer["MemnodeIndex<br/>src/indexer.py<br/><br/>Entity CRUD<br/>Reference extraction<br/>Graph traversal<br/>FTS5 search"]
+    end
+
+    subgraph Data["Data Layer"]
+        MD["Markdown Files<br/><br/>people/*.md<br/>projects/*.md<br/>journal/*.md<br/>todos/*.md"]
+        DB["SQLite Database<br/>.memnode.db<br/><br/>entities, refs<br/>relationships<br/>aliases, inferred_refs<br/>inferred_relationships"]
+    end
+
+    CLI -->|"edit file"| Watcher
+    Watcher -->|"NLP processing"| NLP
+    NLP -->|"store inferences"| Indexer
+    Watcher -->|"basic indexing"| Indexer
+    MCP -->|"query"| Indexer
+    Indexer -->|"read/write"| DB
+    Indexer -->|"parse"| MD
+    CLI -->|"create/edit"| MD
+
+    style UI fill:#e1f5fe
+    style Smart fill:#fff3e0
+    style Core fill:#f3e5f5
+    style Data fill:#e8f5e9
 ```
 
-### How Smart Indexing Works
+### Data Flow
 
-When you edit a file (via `memnode add`, `memnode edit`, etc.), the inline indexer runs automatically:
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI
+    participant Editor
+    participant SmartIndexer
+    participant NLP
+    participant SQLite
 
+    User->>CLI: memnode add person:sarah
+    CLI->>Editor: Open file in $EDITOR
+    User->>Editor: Write content, save, close
+    Editor->>CLI: Editor exits
+    CLI->>SmartIndexer: process_file(sarah-chen.md)
+    
+    SmartIndexer->>SQLite: Basic indexing (entities, refs, todos)
+    SmartIndexer->>NLP: Generate aliases
+    NLP->>SQLite: Store aliases (Sarah, Sarah Chen, SC)
+    SmartIndexer->>NLP: Extract entities from content
+    NLP->>NLP: spaCy NER + fuzzy matching
+    NLP->>SQLite: Store inferred_refs
+    SmartIndexer->>NLP: Compute relationships
+    NLP->>NLP: Co-occurrence + TF-IDF
+    NLP->>SQLite: Store inferred_relationships
+    
+    SmartIndexer->>CLI: Done
+    CLI->>User: "Indexing person:sarah-chen... done"
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  1. FILE SAVED                                                          │
-│     └─► Editor closes after `memnode add person:sarah-chen`             │
-│                                                                         │
-│  2. BASIC INDEXING (indexer.py)                                         │
-│     ├─► Parse YAML frontmatter (name, role, team, etc.)                 │
-│     ├─► Extract explicit references (type:slug patterns)                │
-│     ├─► Parse todos (- [ ] format with #priority @due-date)             │
-│     └─► Update FTS5 search index                                        │
-│                                                                         │
-│  3. ALIAS GENERATION (nlp.py:AliasManager)                              │
-│     └─► "Sarah Chen" → ["Sarah Chen", "Sarah", "Sarah C", "SC"]         │
-│         Stored in `aliases` table with confidence scores                │
-│                                                                         │
-│  4. ENTITY EXTRACTION (nlp.py:EntityMatcher)                            │
-│     ├─► spaCy NER finds PERSON, ORG, PRODUCT entities                   │
-│     ├─► Pattern matching finds capitalized phrases                      │
-│     ├─► Fuzzy matching against known aliases (rapidfuzz)                │
-│     └─► "Sarah" in text → matched to person:sarah-chen (0.85 conf)      │
-│         Stored in `inferred_refs` table                                 │
-│                                                                         │
-│  5. RELATIONSHIP INFERENCE (nlp.py:RelationshipInferrer)                │
-│     ├─► Co-occurrence: entities mentioned within 3 lines                │
-│     │   "Sarah" + "platform-v2" nearby → mentioned_with relationship    │
-│     ├─► TF-IDF similarity: documents with similar content               │
-│     │   sarah-chen.md similar to platform-v2.md → similar_to            │
-│     └─► Stored in `inferred_relationships` with confidence scores       │
-│                                                                         │
-│  6. DONE                                                                │
-│     └─► "Indexing person:sarah-chen... done"                            │
-└─────────────────────────────────────────────────────────────────────────┘
+
+### Entity Resolution
+
+```mermaid
+flowchart LR
+    subgraph Input["Natural Language"]
+        A["'Sarah'"]
+        B["'platform rewrite'"]
+        C["'the auth system'"]
+    end
+
+    subgraph NLP["NLP Pipeline"]
+        D["spaCy NER"]
+        E["Alias Lookup"]
+        F["Fuzzy Match<br/>(rapidfuzz)"]
+    end
+
+    subgraph Output["Resolved Entities"]
+        G["person:sarah-chen<br/>confidence: 0.92"]
+        H["project:platform-v2<br/>confidence: 0.85"]
+        I["topic:auth<br/>confidence: 0.78"]
+    end
+
+    A --> D --> E --> G
+    B --> E --> F --> H
+    C --> F --> I
+
+    style Input fill:#ffebee
+    style NLP fill:#fff3e0
+    style Output fill:#e8f5e9
 ```
 
 ### Database Schema
 
-```sql
--- Core tables (from basic indexer)
-entities          -- All entities (person, project, topic, etc.)
-refs              -- Explicit type:slug references found in content
-relationships     -- Explicit relationships from .relationships.yaml
-todos             -- Parsed todo items with priority, due date, tags
-entities_fts      -- FTS5 full-text search index
+```mermaid
+erDiagram
+    entities ||--o{ refs : "has"
+    entities ||--o{ relationships : "source"
+    entities ||--o{ relationships : "target"
+    entities ||--o{ aliases : "has"
+    entities ||--o{ inferred_refs : "source"
+    entities ||--o{ inferred_refs : "target"
+    entities ||--o{ inferred_relationships : "source"
+    entities ||--o{ inferred_relationships : "target"
+    entities ||--o{ todos : "contains"
 
--- Smart indexing tables (from NLP)
-aliases           -- Entity aliases for fuzzy matching
-                  -- (alias, entity_id, alias_type, confidence)
-                  
-inferred_refs     -- NLP-matched entity mentions
-                  -- (source_id, target_id, matched_text, confidence, context)
-                  
-inferred_relationships  -- Co-occurrence and similarity relationships
-                       -- (source_id, target_id, relation, confidence, evidence)
+    entities {
+        text id PK "person:sarah-chen"
+        text entity_type "person, project, topic"
+        text slug "sarah-chen"
+        text name "Sarah Chen"
+        json metadata "role, team, etc."
+        text content "full markdown"
+        text path "people/sarah-chen.md"
+    }
+
+    refs {
+        int id PK
+        text source_id FK "journal:2025-02-21"
+        text target_id FK "person:sarah-chen"
+        text context "mentioned in standup..."
+        int line_number
+    }
+
+    aliases {
+        text alias PK "Sarah"
+        text entity_id FK "person:sarah-chen"
+        text alias_type "auto, explicit"
+        real confidence "0.85"
+    }
+
+    inferred_refs {
+        int id PK
+        text source_id FK
+        text target_id FK
+        text matched_text "Sarah"
+        real confidence "0.85"
+        text match_type "ner_alias"
+    }
+
+    inferred_relationships {
+        int id PK
+        text source_id FK
+        text target_id FK
+        text relation "mentioned_with"
+        real confidence "0.72"
+        text inference_type "co_occurrence"
+    }
+
+    relationships {
+        int id PK
+        text source_id FK
+        text target_id FK
+        text relation "knows, owns, blocks"
+        text context
+    }
+
+    todos {
+        int id PK
+        text entity_id FK
+        text text "Review RFC"
+        bool completed
+        text priority "high, medium, low"
+        text due_date "2025-03-01"
+    }
 ```
+
+### How Smart Indexing Works
+
+The **Data Flow** diagram above shows the sequence. Here's what happens at each step:
+
+| Step | Component | What Happens |
+|------|-----------|--------------|
+| 1. File Saved | CLI | Editor closes after `memnode add/edit` |
+| 2. Basic Indexing | `indexer.py` | Parse frontmatter, extract `type:slug` refs, parse todos, update FTS5 |
+| 3. Alias Generation | `AliasManager` | "Sarah Chen" → ["Sarah Chen", "Sarah", "Sarah C", "SC"] |
+| 4. Entity Extraction | `EntityMatcher` | spaCy NER + pattern matching + fuzzy matching against aliases |
+| 5. Relationship Inference | `RelationshipInferrer` | Co-occurrence (nearby mentions) + TF-IDF (similar content) |
+| 6. Done | CLI | "Indexing person:sarah-chen... done" |
 
 ### Why No Background Daemon?
 
@@ -359,15 +444,26 @@ The inline approach is sufficient because:
 
 We use classical NLP techniques (no LLMs) to keep it fast and local:
 
-| Component | Library | Purpose |
-|-----------|---------|---------|
-| Named Entity Recognition | spaCy `en_core_web_sm` | Find PERSON, ORG, etc. in text |
-| Fuzzy String Matching | rapidfuzz | Match "Sarah" to "Sarah Chen" |
-| TF-IDF Vectorization | scikit-learn | Document similarity |
-| Pattern Matching | regex | Find capitalized phrases |
+| Component | Library | Python Version | Purpose |
+|-----------|---------|----------------|---------|
+| Named Entity Recognition | spaCy `en_core_web_sm` | 3.10-3.13 | Find PERSON, ORG, etc. in text |
+| Named Entity Recognition | Built-in regex | 3.14+ | Fallback NER using patterns |
+| Fuzzy String Matching | rapidfuzz | All | Match "Sarah" to "Sarah Chen" |
+| TF-IDF Vectorization | scikit-learn | All | Document similarity |
+| Pattern Matching | regex | All | Find capitalized phrases |
+
+**Python version compatibility:**
+- **3.10-3.13**: Full spaCy NER support
+- **3.14+**: Uses regex-based NER (spaCy not yet compatible)
+
+The regex-based NER catches most common patterns:
+- Person names: "John Smith", "Sarah Chen"
+- Organizations: "Acme Corp", "Platform V2"
+- Tech terms: "PostgreSQL", "OAuth2"
 
 **Memory footprint:**
-- spaCy model: ~15MB (loaded once per CLI call)
+- spaCy model: ~15MB (if installed)
+- Regex NER: Zero (built-in)
 - TF-IDF: Computed on-demand, not persisted
 - Total overhead: Minimal, subsecond indexing per file
 
@@ -475,17 +571,67 @@ The `type:slug` syntax is:
 
 ## Dependencies
 
-**Core:**
+**Core (all Python 3.10+):**
 - `mcp` - Model Context Protocol server
 - `typer` + `rich` - CLI interface
 - `pyyaml` - YAML parsing
 - `sqlite3` - Database (built-in)
-
-**Smart Indexing:**
-- `spacy` - Named Entity Recognition (~15MB model)
 - `rapidfuzz` - Fuzzy string matching
 - `scikit-learn` - TF-IDF vectorization
-- `watchdog` - File system monitoring (for `memnode watch`)
+- `watchdog` - File system monitoring
+
+**Optional (Python 3.10-3.13):**
+- `spacy` - Enhanced Named Entity Recognition (~15MB model)
+
+## Alternatives & Comparison
+
+### Personal CRMs
+
+| Tool | Approach | Limitations |
+|------|----------|-------------|
+| **[Clay](https://clay.earth)** | Cloud CRM, auto-imports from email/LinkedIn | Subscription, cloud-only, no AI-native integration |
+| **[Monica](https://monicahq.com)** | Open source personal CRM | Web app, no inline tagging, no NLP |
+| **[Dex](https://getdex.com)** | Relationship manager | Cloud-only, focused on "staying in touch" not context |
+
+### Knowledge Management
+
+| Tool | Approach | Limitations |
+|------|----------|-------------|
+| **[Obsidian](https://obsidian.md)** | Markdown + bidirectional links | No typed entities, no NLP inference, no MCP |
+| **[Logseq](https://logseq.com)** | Outliner + bidirectional links | Block-based, no entity model, no relationship inference |
+| **[Roam Research](https://roamresearch.com)** | Bidirectional linking pioneer | Cloud-only, no entity types, expensive |
+| **[Dendron](https://dendron.so)** | Hierarchical notes for devs | Hierarchy-focused (opposite philosophy) |
+
+### AI-Native Tools
+
+| Tool | Approach | Limitations |
+|------|----------|-------------|
+| **[Mem.ai](https://mem.ai)** | AI-first note-taking | Cloud-based, LLM-heavy (expensive), not social-graph focused |
+| **[Reflect](https://reflect.app)** | AI-powered notes | Cloud-only, general notes, not relationship-focused |
+
+### Feature Comparison
+
+| Feature | Clay/Dex | Monica | Obsidian | memnode |
+|---------|----------|--------|----------|---------|
+| Local-first | No | Self-host | Yes | **Yes** |
+| Plain markdown | No | No | Yes | **Yes** |
+| Typed entities | No | Partial | No | **Yes** |
+| NLP inference | No | No | No | **Yes** |
+| MCP/AI-native | No | No | No | **Yes** |
+| Social graph focus | Yes | Yes | No | **Yes** |
+| Relationship inference | No | No | No | **Yes** |
+| Open source | No | Yes | No | **Yes** |
+| Free | No | Yes | Freemium | **Yes** |
+
+### The Gap memnode Fills
+
+- **Personal CRMs** (Clay, Monica, Dex) are cloud-based and not AI-native
+- **PKM tools** (Obsidian, Roam, Logseq) don't have typed entities or social graph focus
+- **AI tools** (Mem, Reflect) are cloud-only and expensive
+
+**memnode combines:** local-first markdown + typed entities + NLP inference + MCP server + open source
+
+The closest philosophical match is **Monica** (open source personal CRM), but memnode takes a different approach: plain markdown files, CLI-first, inline tagging, and native AI integration via MCP.
 
 ## License
 
