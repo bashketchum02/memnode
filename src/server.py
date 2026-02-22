@@ -5,8 +5,14 @@ Provides AI agents with intelligent querying and synthesis over your knowledge g
 All writes happen via CLI. This server only reads and synthesizes.
 
 Entity format: type:slug (e.g., person:sarah-chen, project:memnode)
+
+Enhanced with:
+- Fuzzy entity matching (finds "Sarah" -> person:sarah-chen)
+- Inferred relationships from co-occurrence analysis
+- NLP-based entity extraction
 """
 
+import json
 import os
 from datetime import date
 from pathlib import Path
@@ -26,6 +32,12 @@ NOTES_DIR = Path(
 server = Server("memnode")
 index: Optional[MemnodeIndex] = None
 
+# NLP components (lazy loaded)
+_alias_manager = None
+_entity_matcher = None
+_relationship_inferrer = None
+_inferred_ref_manager = None
+
 
 def get_index() -> MemnodeIndex:
     """Get or create the index."""
@@ -34,6 +46,25 @@ def get_index() -> MemnodeIndex:
         index = MemnodeIndex(NOTES_DIR)
         index.reindex_all()
     return index
+
+
+def get_nlp_components():
+    """Get or create NLP components (lazy loaded)."""
+    global _alias_manager, _entity_matcher, _relationship_inferrer, _inferred_ref_manager
+    
+    if _alias_manager is None:
+        try:
+            from .nlp import AliasManager, EntityMatcher, RelationshipInferrer, InferredRefManager
+            idx = get_index()
+            _alias_manager = AliasManager(idx.db_path)
+            _entity_matcher = EntityMatcher(_alias_manager, idx.db_path)
+            _relationship_inferrer = RelationshipInferrer(idx.db_path)
+            _inferred_ref_manager = InferredRefManager(idx.db_path)
+        except ImportError:
+            # NLP dependencies not installed
+            pass
+    
+    return _alias_manager, _entity_matcher, _relationship_inferrer, _inferred_ref_manager
 
 
 # =============================================================================
@@ -58,14 +89,36 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="fuzzy_find",
+            description="Find an entity by name using fuzzy matching. Use when you have a name like 'Sarah' or 'platform v2' but don't know the exact entity ID. Returns the best matching entity with confidence score.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name or partial name to search for (e.g., 'Sarah', 'Platform V2', 'auth')",
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Minimum confidence threshold 0-1 (default 0.7)",
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
+        Tool(
             name="get_entity",
-            description="Get full details for an entity including metadata, relationships, and who references it. Use entity format type:slug (e.g., person:sarah-chen, project:memnode).",
+            description="Get full details for an entity including metadata, relationships (both explicit and inferred), and who references it. Use entity format type:slug (e.g., person:sarah-chen, project:memnode).",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "entity_id": {
                         "type": "string",
                         "description": "Entity ID as type:slug (e.g., person:sarah-chen)",
+                    },
+                    "include_inferred": {
+                        "type": "boolean",
+                        "description": "Include inferred relationships from NLP analysis (default true)",
                     },
                 },
                 "required": ["entity_id"],
@@ -86,13 +139,17 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_references",
-            description="Get all places where an entity is mentioned/referenced in notes.",
+            description="Get all places where an entity is mentioned/referenced in notes. Includes both explicit (type:slug) references and inferred mentions (e.g., 'Sarah' matching person:sarah-chen).",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "entity_id": {
                         "type": "string",
                         "description": "Entity ID as type:slug",
+                    },
+                    "include_inferred": {
+                        "type": "boolean",
+                        "description": "Include fuzzy/NLP-inferred references (default true)",
                     },
                 },
                 "required": ["entity_id"],
@@ -135,7 +192,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="find_connection",
-            description="Find how two entities are connected through relationships.",
+            description="Find how two entities are connected through relationships (both explicit and inferred).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -146,11 +203,29 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
-            name="reindex",
-            description="Rebuild the search index. Use after manually editing files.",
+            name="get_related",
+            description="Get entities related to a given entity based on co-occurrence, similarity, and inferred relationships. Good for discovering connections you might not know about.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "entity_id": {"type": "string", "description": "Entity ID as type:slug"},
+                    "min_confidence": {"type": "number", "description": "Minimum confidence 0-1 (default 0.5)"},
+                    "limit": {"type": "integer", "description": "Max results (default 10)"},
+                },
+                "required": ["entity_id"],
+            },
+        ),
+        Tool(
+            name="reindex",
+            description="Rebuild the search index with NLP processing (generates aliases, infers relationships). Use after manually editing files outside of memnode CLI.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "skip_nlp": {
+                        "type": "boolean", 
+                        "description": "Skip NLP processing for faster but less intelligent indexing (default false)",
+                    },
+                },
             },
         ),
     ]
@@ -169,12 +244,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         if name == "search":
             result = _search(idx, arguments["query"], arguments.get("limit", 20))
+        elif name == "fuzzy_find":
+            result = _fuzzy_find(arguments["name"], arguments.get("min_confidence", 0.7))
         elif name == "get_entity":
-            result = _get_entity(idx, arguments["entity_id"])
+            result = _get_entity(
+                idx, 
+                arguments["entity_id"],
+                include_inferred=arguments.get("include_inferred", True)
+            )
         elif name == "list_entities":
             result = _list_entities(idx, arguments.get("entity_type"))
         elif name == "get_references":
-            result = _get_references(idx, arguments["entity_id"])
+            result = _get_references(
+                idx, 
+                arguments["entity_id"],
+                include_inferred=arguments.get("include_inferred", True)
+            )
         elif name == "who_knows_about":
             result = _who_knows_about(idx, arguments["topic"])
         elif name == "whats_on_my_plate":
@@ -189,9 +274,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
         elif name == "find_connection":
             result = _find_connection(idx, arguments["from_entity"], arguments["to_entity"])
+        elif name == "get_related":
+            result = _get_related(
+                arguments["entity_id"],
+                min_confidence=arguments.get("min_confidence", 0.5),
+                limit=arguments.get("limit", 10)
+            )
         elif name == "reindex":
-            idx.reindex_all()
-            result = "Index rebuilt successfully."
+            if arguments.get("skip_nlp"):
+                idx.reindex_all()
+                result = "Index rebuilt (basic mode)."
+            else:
+                result = _reindex_with_nlp(idx)
         else:
             result = f"Unknown tool: {name}"
 
@@ -220,7 +314,44 @@ def _search(idx: MemnodeIndex, query: str, limit: int = 20) -> str:
     return "\n".join(lines)
 
 
-def _get_entity(idx: MemnodeIndex, entity_id: str) -> str:
+def _fuzzy_find(name: str, min_confidence: float = 0.7) -> str:
+    """Find entity by fuzzy name matching."""
+    _, entity_matcher, _, _ = get_nlp_components()
+    
+    if entity_matcher is None:
+        return "NLP components not available. Install spacy and rapidfuzz: pip install spacy rapidfuzz"
+    
+    match = entity_matcher.match_text(name, min_confidence)
+    
+    if not match:
+        return f"No entity found matching '{name}' with confidence >= {min_confidence}"
+    
+    entity_id, confidence, match_type = match
+    
+    # Get entity details
+    idx = get_index()
+    entity = idx.get_entity(entity_id)
+    
+    if not entity:
+        return f"Matched to {entity_id} (confidence: {confidence:.2f}) but entity not found in index"
+    
+    lines = [f"## Found: {entity_id}"]
+    lines.append(f"**Match confidence:** {confidence:.2f}")
+    lines.append(f"**Match type:** {match_type}")
+    lines.append(f"**Name:** {entity['name']}")
+    lines.append(f"**Type:** {entity['entity_type']}")
+    
+    # Show aliases
+    alias_manager, _, _, _ = get_nlp_components()
+    if alias_manager:
+        aliases = alias_manager.get_aliases_for_entity(entity_id)
+        if aliases:
+            lines.append(f"**Known aliases:** {', '.join(aliases[:5])}")
+    
+    return "\n".join(lines)
+
+
+def _get_entity(idx: MemnodeIndex, entity_id: str, include_inferred: bool = True) -> str:
     """Get full entity context."""
     ctx = idx.get_entity_context(entity_id)
 
@@ -236,7 +367,6 @@ def _get_entity(idx: MemnodeIndex, entity_id: str) -> str:
     lines.append(f"**Type:** {entity['entity_type']}")
     
     # Metadata
-    import json
     metadata = entity.get("metadata", {})
     if isinstance(metadata, str):
         metadata = json.loads(metadata)
@@ -256,13 +386,39 @@ def _get_entity(idx: MemnodeIndex, entity_id: str) -> str:
         for r in rels["incoming"]:
             lines.append(f"- <--[{r['relation']}]-- {r['source_id']}")
 
-    # Referenced by
+    # Inferred relationships
+    if include_inferred:
+        _, _, rel_inferrer, _ = get_nlp_components()
+        if rel_inferrer:
+            inferred = rel_inferrer.get_inferred_relationships(entity_id, min_confidence=0.5)
+            if inferred:
+                lines.append(f"\n## Inferred Relationships ({len(inferred)} found)")
+                for r in inferred[:10]:
+                    direction = "->" if r["source_id"] == entity_id else "<-"
+                    other = r["target_id"] if r["source_id"] == entity_id else r["source_id"]
+                    lines.append(f"- {direction} {other} [{r['relation']}] (confidence: {r['confidence']:.2f})")
+                if len(inferred) > 10:
+                    lines.append(f"  ... and {len(inferred) - 10} more")
+
+    # Referenced by (explicit)
     if refs_to:
-        lines.append(f"\n## Referenced by ({len(refs_to)} mentions)")
+        lines.append(f"\n## Referenced by ({len(refs_to)} explicit mentions)")
         for ref in refs_to[:10]:
             lines.append(f"- **{ref['source_id']}**: \"{ref['context'][:80]}...\"")
         if len(refs_to) > 10:
             lines.append(f"  ... and {len(refs_to) - 10} more")
+
+    # Inferred references
+    if include_inferred:
+        _, _, _, inferred_ref_mgr = get_nlp_components()
+        if inferred_ref_mgr:
+            inferred_refs = inferred_ref_mgr.get_inferred_refs_to(entity_id, min_confidence=0.7)
+            if inferred_refs:
+                lines.append(f"\n## Inferred Mentions ({len(inferred_refs)} fuzzy matches)")
+                for ref in inferred_refs[:5]:
+                    lines.append(f"- **{ref['source_id']}**: matched '{ref['matched_text']}' (confidence: {ref['confidence']:.2f})")
+                if len(inferred_refs) > 5:
+                    lines.append(f"  ... and {len(inferred_refs) - 5} more")
 
     # Related todos
     if ctx.get("related_todos"):
@@ -301,28 +457,56 @@ def _list_entities(idx: MemnodeIndex, entity_type: Optional[str] = None) -> str:
         return "\n".join(lines)
 
 
-def _get_references(idx: MemnodeIndex, entity_id: str) -> str:
+def _get_references(idx: MemnodeIndex, entity_id: str, include_inferred: bool = True) -> str:
     """Get all references to an entity."""
     refs = idx.get_references_to(entity_id)
 
-    if not refs:
-        return f"No references found to {entity_id}"
-
-    lines = [f"# References to {entity_id} ({len(refs)} mentions)\n"]
+    lines = [f"# References to {entity_id}\n"]
     
-    # Group by source
-    by_source = {}
-    for ref in refs:
-        source = ref["source_id"]
-        if source not in by_source:
-            by_source[source] = []
-        by_source[source].append(ref)
+    # Explicit references
+    if refs:
+        lines.append(f"## Explicit References ({len(refs)} mentions)")
+        
+        # Group by source
+        by_source = {}
+        for ref in refs:
+            source = ref["source_id"]
+            if source not in by_source:
+                by_source[source] = []
+            by_source[source].append(ref)
 
-    for source, source_refs in by_source.items():
-        lines.append(f"## {source}")
-        for ref in source_refs:
-            lines.append(f"- Line {ref['line_number']}: \"{ref['context']}\"")
-        lines.append("")
+        for source, source_refs in by_source.items():
+            lines.append(f"### {source}")
+            for ref in source_refs:
+                lines.append(f"- Line {ref['line_number']}: \"{ref['context']}\"")
+            lines.append("")
+    else:
+        lines.append("## Explicit References\nNo explicit `type:slug` references found.\n")
+
+    # Inferred references
+    if include_inferred:
+        _, _, _, inferred_ref_mgr = get_nlp_components()
+        if inferred_ref_mgr:
+            inferred_refs = inferred_ref_mgr.get_inferred_refs_to(entity_id, min_confidence=0.6)
+            if inferred_refs:
+                lines.append(f"## Inferred References ({len(inferred_refs)} fuzzy matches)")
+                
+                by_source = {}
+                for ref in inferred_refs:
+                    source = ref["source_id"]
+                    if source not in by_source:
+                        by_source[source] = []
+                    by_source[source].append(ref)
+                
+                for source, source_refs in by_source.items():
+                    lines.append(f"### {source}")
+                    for ref in source_refs:
+                        lines.append(f"- Matched '{ref['matched_text']}' (confidence: {ref['confidence']:.2f})")
+                        lines.append(f"  Context: \"{ref['context'][:100]}...\"")
+                    lines.append("")
+
+    if len(lines) <= 2:
+        return f"No references found to {entity_id}"
 
     return "\n".join(lines)
 
@@ -439,6 +623,75 @@ def _find_connection(idx: MemnodeIndex, from_entity: str, to_entity: str) -> str
         current = step["to"] if step["direction"] == "->" else step["from"]
 
     return "\n".join(lines)
+
+
+def _get_related(entity_id: str, min_confidence: float = 0.5, limit: int = 10) -> str:
+    """Get entities related through inferred relationships."""
+    _, _, rel_inferrer, _ = get_nlp_components()
+    
+    if rel_inferrer is None:
+        return "NLP components not available. Run `memnode reindex --with-nlp` first."
+    
+    inferred = rel_inferrer.get_inferred_relationships(entity_id, min_confidence=min_confidence)
+    
+    if not inferred:
+        return f"No inferred relationships found for {entity_id}. Try running `reindex` with NLP enabled."
+    
+    lines = [f"# Related to {entity_id}\n"]
+    
+    # Group by relationship type
+    by_type: dict[str, list] = {}
+    for rel in inferred:
+        rtype = rel["relation"]
+        if rtype not in by_type:
+            by_type[rtype] = []
+        by_type[rtype].append(rel)
+    
+    for rtype, rels in by_type.items():
+        lines.append(f"## {rtype.replace('_', ' ').title()}")
+        for rel in rels[:limit]:
+            other = rel["target_id"] if rel["source_id"] == entity_id else rel["source_id"]
+            direction = "->" if rel["source_id"] == entity_id else "<-"
+            lines.append(f"- {direction} **{other}** (confidence: {rel['confidence']:.2f})")
+            if rel.get("evidence"):
+                evidence = rel["evidence"]
+                if isinstance(evidence, str):
+                    evidence = json.loads(evidence)
+                if evidence:
+                    lines.append(f"  Evidence: \"{evidence[0][:60]}...\"")
+        lines.append("")
+    
+    # Also compute TF-IDF similarity
+    similar = rel_inferrer.compute_tfidf_similarity(entity_id, top_k=5)
+    if similar:
+        lines.append("## Similar Content (TF-IDF)")
+        for other_id, score in similar:
+            if score >= min_confidence:
+                lines.append(f"- **{other_id}** (similarity: {score:.2f})")
+    
+    return "\n".join(lines)
+
+
+def _reindex_with_nlp(idx: MemnodeIndex) -> str:
+    """Reindex with full NLP processing."""
+    try:
+        from .watcher import SmartIndexer
+        
+        smart_indexer = SmartIndexer(idx.notes_dir, enable_nlp=True)
+        smart_indexer.full_reindex_with_nlp()
+        
+        # Reset NLP components to pick up new data
+        global _alias_manager, _entity_matcher, _relationship_inferrer, _inferred_ref_manager
+        _alias_manager = None
+        _entity_matcher = None
+        _relationship_inferrer = None
+        _inferred_ref_manager = None
+        
+        return "Index rebuilt with NLP processing. Aliases generated, relationships inferred."
+    except ImportError as e:
+        return f"NLP dependencies not installed: {e}. Run: pip install spacy rapidfuzz scikit-learn watchdog"
+    except Exception as e:
+        return f"Error during NLP reindex: {e}"
 
 
 def main():

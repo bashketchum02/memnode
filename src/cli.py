@@ -252,14 +252,53 @@ def get_index():
     return MemnodeIndex(notes_dir, db_path)
 
 
-def update_index(entity_type: str, slug: str):
-    """Update the index for a single entity."""
+def smart_index_entity(entity_type: str, slug: str, show_progress: bool = True):
+    """
+    Index a single entity with NLP processing.
+    
+    This is the inline post-edit hook - runs NLP indexing immediately
+    after any file edit. Keeps the graph smart without a background daemon.
+    """
+    notes_dir = get_notes_dir()
+    entity_id = f"{entity_type}:{slug}"
+    path = get_entity_path(entity_type, slug)
+    
+    if not path.exists():
+        return
+    
     try:
-        index = get_index()
-        index.index_entity(entity_type, slug)
-        index.close()
-    except Exception:
-        pass  # Silently ignore indexing errors in CLI
+        from .watcher import SmartIndexer
+        
+        if show_progress:
+            rprint(f"[dim]Indexing {entity_id}...[/dim]", end=" ")
+        
+        smart_indexer = SmartIndexer(notes_dir, enable_nlp=True)
+        smart_indexer.process_file(path)
+        
+        if show_progress:
+            rprint(f"[green]done[/green]")
+            
+    except ImportError:
+        # Fall back to basic indexing if NLP deps not installed
+        if show_progress:
+            rprint(f"[dim]Indexing {entity_id} (basic)...[/dim]", end=" ")
+        try:
+            index = get_index()
+            index.index_entity(entity_type, slug)
+            index.close()
+            if show_progress:
+                rprint(f"[green]done[/green]")
+        except Exception:
+            if show_progress:
+                rprint(f"[yellow]skipped[/yellow]")
+    except Exception as e:
+        if show_progress:
+            rprint(f"[yellow]error: {e}[/yellow]")
+
+
+def update_index(entity_type: str, slug: str):
+    """Update the index for a single entity (legacy, uses smart_index_entity)."""
+    smart_index_entity(entity_type, slug, show_progress=False)
 
 
 def update_relationships_index():
@@ -422,13 +461,15 @@ def add(
     with open(path, "w") as f:
         f.write(content)
     
-    # Update index
-    update_index(entity_type, slug)
-    
     rprint(f"[green]✓[/green] Created {entity_type}:{slug}")
     
     if edit:
         open_in_editor(path)
+        # Smart index after editor closes (NLP processing)
+        smart_index_entity(entity_type, slug)
+    else:
+        # Still index even without editing
+        smart_index_entity(entity_type, slug)
 
 
 @app.command()
@@ -690,6 +731,8 @@ def edit(
         raise typer.Exit(1)
     
     open_in_editor(path)
+    # Smart index after editor closes (NLP processing)
+    smart_index_entity(entity_type, slug)
 
 
 @app.command()
@@ -782,8 +825,8 @@ type: todo
     with open(inbox_path, "w") as f:
         f.write(content)
 
-    # Update index
-    update_index("todolist", "inbox")
+    # Smart index (NLP processing for entity extraction)
+    smart_index_entity("todolist", "inbox")
     
     rprint(f"[green]✓[/green] Captured: {text}")
 
@@ -847,11 +890,10 @@ def one_on_one(
     with open(path, "w") as f:
         f.write(content)
     
-    # Update index
-    update_index(entity_type, slug)
-    
     rprint(f"[green]✓[/green] Added 1:1 entry for {slug}")
     open_in_editor(path)
+    # Smart index after editor closes (NLP processing)
+    smart_index_entity(entity_type, slug)
 
 
 @app.command()
@@ -911,8 +953,8 @@ project: {project_slug or 'general'}
     with open(todo_path, "w") as f:
         f.write(content)
     
-    # Update index
-    update_index("todolist", todo_path.stem)
+    # Smart index (NLP processing for entity extraction)
+    smart_index_entity("todolist", todo_path.stem)
     
     rprint(f"[green]✓[/green] Added todo to {todo_path.name}")
 
@@ -956,12 +998,11 @@ date: {today}
         with open(path, "w") as f:
             f.write(content)
         
-        # Update index
-        update_index("journal", today)
-        
         rprint(f"[green]✓[/green] Created journal for {today}")
     
     open_in_editor(path)
+    # Smart index after editor closes (NLP processing)
+    smart_index_entity("journal", today)
 
 
 # =============================================================================
@@ -1054,8 +1095,13 @@ def config():
 
 
 @app.command()
-def reindex():
-    """Rebuild the search index from scratch."""
+def reindex(
+    no_nlp: bool = typer.Option(
+        False, "--no-nlp",
+        help="Skip NLP processing (faster, but no fuzzy matching or inferred relationships)"
+    ),
+):
+    """Rebuild the search index from scratch (with NLP by default)."""
     from .indexer import MemnodeIndex
     
     notes_dir = get_notes_dir()
@@ -1064,13 +1110,93 @@ def reindex():
         rprint(f"[dim]Run 'memnode init' first[/dim]")
         raise typer.Exit(1)
     
-    rprint(f"[dim]Reindexing {notes_dir}...[/dim]")
+    if no_nlp:
+        rprint(f"[dim]Reindexing {notes_dir} (basic mode)...[/dim]")
+        index = MemnodeIndex(notes_dir)
+        index.reindex_all()
+        index.close()
+        rprint(f"[green]✓[/green] Index rebuilt (basic)")
+    else:
+        rprint(f"[dim]Reindexing {notes_dir} with NLP processing...[/dim]")
+        try:
+            from .watcher import SmartIndexer
+            smart_indexer = SmartIndexer(notes_dir, enable_nlp=True)
+            smart_indexer.full_reindex_with_nlp()
+            rprint(f"[green]✓[/green] Index rebuilt (aliases + inferred relationships)")
+        except ImportError as e:
+            rprint(f"[yellow]Warning:[/yellow] NLP dependencies not available: {e}")
+            rprint(f"[dim]Falling back to basic indexing...[/dim]")
+            index = MemnodeIndex(notes_dir)
+            index.reindex_all()
+            index.close()
+            rprint(f"[green]✓[/green] Index rebuilt (basic)")
+            rprint(f"[dim]For smart indexing: pip install spacy rapidfuzz scikit-learn[/dim]")
+
+
+@app.command()
+def watch(
+    no_nlp: bool = typer.Option(
+        False, "--no-nlp",
+        help="Disable NLP processing (faster, but no fuzzy matching)"
+    ),
+    debounce: float = typer.Option(
+        2.0, "--debounce", "-d",
+        help="Debounce delay in seconds"
+    ),
+    reindex_first: bool = typer.Option(
+        False, "--reindex", "-r",
+        help="Do a full reindex before starting the watcher"
+    ),
+):
+    """
+    Watch for file changes and auto-index.
     
-    index = MemnodeIndex(notes_dir)
-    index.reindex_all()
-    index.close()
+    Runs a daemon that watches your notes directory and automatically
+    re-indexes files when they change. Like a web crawler for your knowledge graph.
     
-    rprint(f"[green]✓[/green] Index rebuilt")
+    Press Ctrl+C to stop.
+    """
+    notes_dir = get_notes_dir()
+    if not notes_dir.exists():
+        rprint(f"[red]Error:[/red] Notes directory does not exist: {notes_dir}")
+        rprint(f"[dim]Run 'memnode init' first[/dim]")
+        raise typer.Exit(1)
+    
+    try:
+        from .watcher import MemnodeWatcher
+    except ImportError as e:
+        rprint(f"[red]Error:[/red] Watcher dependencies not installed: {e}")
+        rprint(f"[dim]Run: pip install watchdog spacy rapidfuzz scikit-learn[/dim]")
+        raise typer.Exit(1)
+    
+    rprint(Panel(
+        f"[bold]Watching:[/bold] {notes_dir}\n"
+        f"[bold]NLP:[/bold] {'disabled' if no_nlp else 'enabled'}\n"
+        f"[bold]Debounce:[/bold] {debounce}s\n\n"
+        "[dim]Press Ctrl+C to stop[/dim]",
+        title="memnode watcher",
+        style="blue"
+    ))
+    
+    watcher = MemnodeWatcher(
+        notes_dir=notes_dir,
+        enable_nlp=not no_nlp,
+        debounce_delay=debounce
+    )
+    
+    if reindex_first:
+        rprint("[dim]Running initial reindex...[/dim]")
+        watcher.smart_indexer.full_reindex_with_nlp()
+        rprint("[green]✓[/green] Initial reindex complete")
+    
+    rprint("\n[green]Watcher started.[/green] Editing files will trigger re-indexing.\n")
+    
+    try:
+        watcher.start(blocking=True)
+    except KeyboardInterrupt:
+        pass
+    
+    rprint("\n[dim]Watcher stopped[/dim]")
 
 
 def main():

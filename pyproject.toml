@@ -1,7 +1,7 @@
 [project]
 name = "memnode"
 version = "0.1.0"
-description = "Personal knowledge graph for engineers - context management with AI-powered synthesis"
+description = "Personal social graph for engineers - track your network with AI-powered context"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -28,6 +28,11 @@ dependencies = [
     "python-frontmatter>=1.0.0",
     "typer>=0.24.0",
     "rich>=14.3.3",
+    # Smart indexing dependencies
+    "watchdog>=4.0.0",        # File system monitoring
+    "rapidfuzz>=3.0.0",       # Fast fuzzy string matching
+    "scikit-learn>=1.4.0",    # TF-IDF vectorization
+    "spacy>=3.7.0",           # NER and NLP
 ]
 
 [project.optional-dependencies]
@@ -40,6 +45,7 @@ dev = [
 [project.scripts]
 memnode = "src.cli:main"
 memnode-server = "src.server:main"
+memnode-watch = "src.watcher:main"
 memnode-setup = "setup:main"
 
 [project.urls]
