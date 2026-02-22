@@ -16,16 +16,16 @@ memnode is a context-aware social graph where you track people, projects, and th
 │                                                                    │
 │  memnode automatically infers:                                     │
 │                                                                    │
-│    "Sarah" ──► person:sarah-chen                                  │
-│    "platform rewrite" ──► project:platform-v2                     │
-│    "Kubernetes" ──► topic:kubernetes                              │
-│    "platform team" ──► team:platform                              │
+│    "Sarah" ──► person:sarah-chen                                   │
+│    "platform rewrite" ──► project:platform-v2                      │
+│    "Kubernetes" ──► topic:kubernetes                               │
+│    "platform team" ──► team:platform                               │
 │                                                                    │
 │  And builds the graph:                                             │
 │                                                                    │
-│    person:sarah-chen ───[mentioned_with]───► project:platform-v2  │
-│           │                                         ▲             │
-│           └──────[knows]──► topic:kubernetes       │              │
+│    person:sarah-chen ───[mentioned_with]───► project:platform-v2   │
+│           │                                         ▲              │
+│           └──────[knows]──► topic:kubernetes        │              │
 │                                                     │              │
 │                              team:platform ─────────┘              │
 └────────────────────────────────────────────────────────────────────┘
@@ -275,7 +275,7 @@ memnode is built as a **local-first knowledge graph** with three layers:
 │  projects/platform-v2.md    │  - entities (id, type, content, meta)     │
 │  journal/2025-02-21.md      │  - refs (explicit type:slug references)   │
 │  todos/inbox.md             │  - relationships (explicit links)         │
-│                             │  - aliases (name → entity mapping)       │
+│                             │  - aliases (name → entity mapping)        │
 │  .relationships.yaml        │  - inferred_refs (NLP-matched mentions)   │
 │  (explicit relationships)   │  - inferred_relationships (co-occurrence) │
 │                             │  - entities_fts (full-text search)        │
@@ -289,34 +289,34 @@ When you edit a file (via `memnode add`, `memnode edit`, etc.), the inline index
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  1. FILE SAVED                                                          │
-│     └─► Editor closes after `memnode add person:sarah-chen`            │
+│     └─► Editor closes after `memnode add person:sarah-chen`             │
 │                                                                         │
 │  2. BASIC INDEXING (indexer.py)                                         │
-│     ├─► Parse YAML frontmatter (name, role, team, etc.)                │
-│     ├─► Extract explicit references (type:slug patterns)               │
-│     ├─► Parse todos (- [ ] format with #priority @due-date)            │
-│     └─► Update FTS5 search index                                       │
+│     ├─► Parse YAML frontmatter (name, role, team, etc.)                 │
+│     ├─► Extract explicit references (type:slug patterns)                │
+│     ├─► Parse todos (- [ ] format with #priority @due-date)             │
+│     └─► Update FTS5 search index                                        │
 │                                                                         │
 │  3. ALIAS GENERATION (nlp.py:AliasManager)                              │
-│     └─► "Sarah Chen" → ["Sarah Chen", "Sarah", "Sarah C", "SC"]       │
+│     └─► "Sarah Chen" → ["Sarah Chen", "Sarah", "Sarah C", "SC"]         │
 │         Stored in `aliases` table with confidence scores                │
 │                                                                         │
 │  4. ENTITY EXTRACTION (nlp.py:EntityMatcher)                            │
-│     ├─► spaCy NER finds PERSON, ORG, PRODUCT entities                  │
-│     ├─► Pattern matching finds capitalized phrases                     │
-│     ├─► Fuzzy matching against known aliases (rapidfuzz)               │
-│     └─► "Sarah" in text → matched to person:sarah-chen (0.85 conf)    │
+│     ├─► spaCy NER finds PERSON, ORG, PRODUCT entities                   │
+│     ├─► Pattern matching finds capitalized phrases                      │
+│     ├─► Fuzzy matching against known aliases (rapidfuzz)                │
+│     └─► "Sarah" in text → matched to person:sarah-chen (0.85 conf)      │
 │         Stored in `inferred_refs` table                                 │
 │                                                                         │
 │  5. RELATIONSHIP INFERENCE (nlp.py:RelationshipInferrer)                │
-│     ├─► Co-occurrence: entities mentioned within 3 lines               │
-│     │   "Sarah" + "platform-v2" nearby → mentioned_with relationship   │
-│     ├─► TF-IDF similarity: documents with similar content              │
-│     │   sarah-chen.md similar to platform-v2.md → similar_to           │
-│     └─► Stored in `inferred_relationships` with confidence scores      │
+│     ├─► Co-occurrence: entities mentioned within 3 lines                │
+│     │   "Sarah" + "platform-v2" nearby → mentioned_with relationship    │
+│     ├─► TF-IDF similarity: documents with similar content               │
+│     │   sarah-chen.md similar to platform-v2.md → similar_to            │
+│     └─► Stored in `inferred_relationships` with confidence scores       │
 │                                                                         │
 │  6. DONE                                                                │
-│     └─► "Indexing person:sarah-chen... done"                           │
+│     └─► "Indexing person:sarah-chen... done"                            │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
