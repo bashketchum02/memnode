@@ -244,6 +244,34 @@ def get_notes_dir() -> Path:
     return Path(dir_path).expanduser().resolve()
 
 
+def get_index():
+    """Get the memnode index (lazy-loaded singleton)."""
+    from .indexer import MemnodeIndex
+    notes_dir = get_notes_dir()
+    db_path = notes_dir / ".memnode.db"
+    return MemnodeIndex(notes_dir, db_path)
+
+
+def update_index(entity_type: str, slug: str):
+    """Update the index for a single entity."""
+    try:
+        index = get_index()
+        index.index_entity(entity_type, slug)
+        index.close()
+    except Exception:
+        pass  # Silently ignore indexing errors in CLI
+
+
+def update_relationships_index():
+    """Update the relationships in the index."""
+    try:
+        index = get_index()
+        index.index_relationships()
+        index.close()
+    except Exception:
+        pass  # Silently ignore indexing errors in CLI
+
+
 def get_relationships_file() -> Path:
     """Get the relationships YAML file path."""
     return get_notes_dir() / ".relationships.yaml"
@@ -394,6 +422,9 @@ def add(
     with open(path, "w") as f:
         f.write(content)
     
+    # Update index
+    update_index(entity_type, slug)
+    
     rprint(f"[green]✓[/green] Created {entity_type}:{slug}")
     
     if edit:
@@ -464,6 +495,10 @@ def link(
     })
     
     save_relationships(relationships)
+    
+    # Update index
+    update_relationships_index()
+    
     rprint(f"[green]✓[/green] {source_type}:{source_slug} --[{relation}]--> {target_type}:{target_slug}")
 
 
@@ -500,6 +535,7 @@ def unlink(
     removed = original_count - len(relationships)
     if removed > 0:
         save_relationships(relationships)
+        update_relationships_index()
         rprint(f"[green]✓[/green] Removed {removed} relationship(s)")
     else:
         rprint("[yellow]No matching relationships found[/yellow]")
@@ -694,9 +730,13 @@ def rm(
     if related:
         relationships = [r for r in relationships if r not in related]
         save_relationships(relationships)
+        update_relationships_index()
     
     # Remove file
     path.unlink()
+    
+    # Update index (remove entity)
+    update_index(entity_type, slug)
     
     rprint(f"[green]✓[/green] Removed {entity}")
     if related:
@@ -742,6 +782,9 @@ type: todo
     with open(inbox_path, "w") as f:
         f.write(content)
 
+    # Update index
+    update_index("todolist", "inbox")
+    
     rprint(f"[green]✓[/green] Captured: {text}")
 
 
@@ -804,6 +847,9 @@ def one_on_one(
     with open(path, "w") as f:
         f.write(content)
     
+    # Update index
+    update_index(entity_type, slug)
+    
     rprint(f"[green]✓[/green] Added 1:1 entry for {slug}")
     open_in_editor(path)
 
@@ -865,6 +911,9 @@ project: {project_slug or 'general'}
     with open(todo_path, "w") as f:
         f.write(content)
     
+    # Update index
+    update_index("todolist", todo_path.stem)
+    
     rprint(f"[green]✓[/green] Added todo to {todo_path.name}")
 
 
@@ -906,6 +955,10 @@ date: {today}
 """
         with open(path, "w") as f:
             f.write(content)
+        
+        # Update index
+        update_index("journal", today)
+        
         rprint(f"[green]✓[/green] Created journal for {today}")
     
     open_in_editor(path)
@@ -950,6 +1003,14 @@ type: todo
     rprint("\nDirectories:")
     for d in sorted(dirs):
         rprint(f"  [dim]└──[/dim] {d}/")
+    
+    # Build initial index
+    from .indexer import MemnodeIndex
+    rprint("\n[dim]Building search index...[/dim]")
+    index = MemnodeIndex(notes_dir)
+    index.reindex_all()
+    index.close()
+    rprint(f"[green]✓[/green] Index ready")
 
 
 @app.command()
@@ -990,6 +1051,26 @@ def config():
     rprint()
     rprint("[bold]To change directory:[/bold]")
     rprint("  export MEMNODE_DIR=/path/to/your/notes")
+
+
+@app.command()
+def reindex():
+    """Rebuild the search index from scratch."""
+    from .indexer import MemnodeIndex
+    
+    notes_dir = get_notes_dir()
+    if not notes_dir.exists():
+        rprint(f"[red]Error:[/red] Notes directory does not exist: {notes_dir}")
+        rprint(f"[dim]Run 'memnode init' first[/dim]")
+        raise typer.Exit(1)
+    
+    rprint(f"[dim]Reindexing {notes_dir}...[/dim]")
+    
+    index = MemnodeIndex(notes_dir)
+    index.reindex_all()
+    index.close()
+    
+    rprint(f"[green]✓[/green] Index rebuilt")
 
 
 def main():

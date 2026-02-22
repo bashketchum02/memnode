@@ -123,6 +123,100 @@ class MemnodeIndex:
         """)
         self.conn.commit()
 
+    def index_entity(self, entity_type: str, slug: str):
+        """Index or reindex a single entity (incremental update)."""
+        entity_id = f"{entity_type}:{slug}"
+        dir_name = ENTITY_DIRS.get(entity_type)
+        
+        if dir_name:
+            path = self.notes_dir / dir_name / f"{slug}.md"
+        elif entity_type == "journal":
+            path = self.notes_dir / "journal" / f"{slug}.md"
+        elif entity_type == "todolist":
+            path = self.notes_dir / "todos" / f"{slug}.md"
+        else:
+            return
+        
+        # Delete existing data for this entity
+        self._delete_entity_data(entity_id)
+        
+        # Reindex if file exists
+        if path.exists():
+            if entity_type in ENTITY_DIRS:
+                self._index_entity_file(entity_type, path)
+            elif entity_type == "journal":
+                self._index_journal_file(path)
+            elif entity_type == "todolist":
+                self._index_todolist_file(path)
+        
+        self.conn.commit()
+
+    def _delete_entity_data(self, entity_id: str):
+        """Delete all data for an entity (for incremental reindex)."""
+        self.conn.execute("DELETE FROM todos WHERE entity_id = ?", (entity_id,))
+        self.conn.execute("DELETE FROM refs WHERE source_id = ?", (entity_id,))
+        self.conn.execute("DELETE FROM entities_fts WHERE id = ?", (entity_id,))
+        self.conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+
+    def _index_journal_file(self, path: Path):
+        """Index a single journal file."""
+        slug = path.stem
+        entity_id = f"journal:{slug}"
+        
+        try:
+            with open(path) as f:
+                content = f.read()
+        except Exception:
+            return
+        
+        rel_path = str(path.relative_to(self.notes_dir))
+        now = datetime.now().isoformat()
+        
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO entities 
+            (id, entity_type, slug, name, metadata, content, path, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (entity_id, "journal", slug, slug, "{}", content, rel_path, now),
+        )
+        
+        self._extract_todos(entity_id, content)
+        self._index_refs(entity_id, content)
+
+    def _index_todolist_file(self, path: Path):
+        """Index a single todolist file."""
+        slug = path.stem
+        entity_id = f"todolist:{slug}"
+        
+        try:
+            with open(path) as f:
+                content = f.read()
+        except Exception:
+            return
+        
+        rel_path = str(path.relative_to(self.notes_dir))
+        now = datetime.now().isoformat()
+        
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO entities 
+            (id, entity_type, slug, name, metadata, content, path, indexed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (entity_id, "todolist", slug, slug.replace("-", " ").title(),
+             "{}", content, rel_path, now),
+        )
+        
+        self._extract_todos(entity_id, content)
+        self._index_refs(entity_id, content)
+
+    def index_relationships(self):
+        """Reindex all relationships from YAML file."""
+        self.conn.execute("DELETE FROM relationships")
+        self._index_relationships()
+        self.conn.commit()
+
     def reindex_all(self):
         """Rebuild the entire index from scratch."""
         self.conn.executescript("""
